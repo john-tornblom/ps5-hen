@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -53,6 +56,6 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           git tag -f dev-latest
-          git push -f origin dev-latest
+          git push -f https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git dev-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
