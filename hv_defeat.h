@@ -77,4 +77,4 @@ int stage5_patch_kernel(hv_defeat_ctx *ctx);
 int stage6_install_kexec(hv_defeat_ctx *ctx);
 int stage7_run_hen(hv_defeat_ctx *ctx);
 int kexec(uint64_t fptr);
-int run_hv_defeat(uint64_t mp4_softc, uint64_t zcn_bar2);
+int run_hv_defeat(void); //uint64_t mp4_softc, uint64_t zcn_bar2);
