@@ -123,11 +123,13 @@ enum pde_shift {
 };
 #define PDE_PRESENT_MASK         1UL
 #define PDE_RW_MASK              1UL
-#define PDE_PS_MASK              1UL << 7
+#define PDE_PS_MASK              1UL
+#define PDE_GLOBAL_MASK          1UL
 #define PDE_XOTEXT_MASK          1UL
 #define PDE_PROTECTION_KEY_MASK  0xFUL
 #define PDE_EXECUTE_DISABLE_MASK 1UL
 #define PDE_ADDR_MASK            0x000ffffffffff000ULL
+#define PDE_EXECUTE_DISABLE_MASK 1UL
 #define PDE_FIELD(pde, name)         (((pde) >> PDE_##name) & PDE_##name##_MASK)
 #define PDE_ADDR(pde)                ((pde) & PDE_ADDR_MASK)
 #define SET_PDE_BIT(pde, name)       ((pde) |= (PDE_##name##_MASK << PDE_##name))
@@ -140,7 +142,7 @@ static inline uint64_t find_pml4e(uint64_t pmap, uint64_t va, uint64_t *out) {
     if (!pm_pml4) return ~0ULL;
     uint64_t addr = pm_pml4 + (((va >> 39) & 0x1FF) * 8);
     kernel_copyout(addr, out, 8);
-    //std::print("pm_pml4 : {:016x} Level 0 Add: {:016x} - Value: {:016x}\n", pm_pml4, addr, *out);
+    std::print("pm_pml4 : {:016x} Level 0 Add: {:016x} - Value: {:016x}\n", pm_pml4, addr, *out);
     return addr;
 }
 static inline uint64_t find_pdpe(uint64_t pmap, uint64_t va, uint64_t *out) {
@@ -148,7 +150,7 @@ static inline uint64_t find_pdpe(uint64_t pmap, uint64_t va, uint64_t *out) {
     if (find_pml4e(pmap, va, &pml4e) == ~0ULL) return ~0ULL;
     uint64_t addr = get_dmap_addr(PDE_ADDR(pml4e)) + (((va >> 30) & 0x1FF) * 8);
     kernel_copyout(addr, out, 8);
-    //std::print("Level 1: {:016x} - Value: {:016x}\n", addr, *out);
+    std::print("Level 1: {:016x} - Value: {:016x}\n", addr, *out);
     return addr;
 }
 static inline uint64_t find_pde(uint64_t pmap, uint64_t va, uint64_t *out) {
@@ -156,16 +158,72 @@ static inline uint64_t find_pde(uint64_t pmap, uint64_t va, uint64_t *out) {
     if (find_pdpe(pmap, va, &pdpe) == ~0ULL) return ~0ULL;
     uint64_t addr = get_dmap_addr(PDE_ADDR(pdpe)) + (((va >> 21) & 0x1FF) * 8);
     kernel_copyout(addr, out, 8);
-    //std::print("Level 2: {:016x} - Value: {:016x}\n", addr, *out);
+    std::print("Level 2: {:016x} - Value: {:016x}\n", addr, *out);
     return addr;
 }
 static inline uint64_t find_pte(uint64_t pmap, uint64_t va, uint64_t *out) {
     uint64_t pde;
     if (find_pde(pmap, va, &pde) == ~0ULL) return ~0ULL;
     // If PS (Page Size) is 1 means that we don't need to drill down to next level
-    if (pde & PDE_PS_MASK) return ~0ULL;
+    if (PDE_FIELD(pde, PS)) return ~0ULL;
     uint64_t addr = get_dmap_addr(PDE_ADDR(pde)) + (((va >> 12) & 0x1FF) * 8);
     kernel_copyout(addr, out, 8);
-    //std::print("Level 3: {:016x} - Value: {:016x}\n", addr, *out);
+    std::print("Level 3: {:016x} - Value: {:016x}\n", addr, *out);
     return addr;
+}
+
+static inline uint64_t get_cr3(void) {
+    static uint64_t cr3 = 0;
+    if (!cr3) {
+        uint64_t kb = KERNEL_ADDRESS_TEXT_BASE;
+        uint64_t pmap = kb + fw_off(g_fw(), "OFF_PMAP_STORE");
+        
+        kernel_copyout(pmap + fw_off(g_fw(), "PMAP_PM_CR3"), &cr3, 8);
+    }
+    return cr3;
+}
+
+static inline uint64_t page_remove_global (uint64_t va)
+{
+    std::print("Enter page_remove_global : {:016x}\n", va);
+
+    uint64_t table_phys = get_cr3();
+
+    for (int level = 0; level < 4; level++) 
+    {
+        int shift = 39 - (level * 9);
+        uint64_t idx = (va >> shift) & 0x1FF;
+        uint64_t entry_va = get_dmap_addr((table_phys & PDE_ADDR_MASK) + idx * 8);
+        uint64_t entry;
+
+        // Read Level X entry
+        kernel_copyout(entry_va, &entry, sizeof(entry));
+        std::print("This is level: {:02d} - Add: 0x{:016x} Entry: 0x{:016x}\n", level, entry_va, entry);
+
+
+        if (!(entry & PDE_PRESENT_MASK))
+            return 0;
+
+        if ((level == 1 || level == 2) && (PDE_FIELD(entry, PS))) 
+        {
+            CLEAR_PDE_BIT(entry, GLOBAL);
+            kernel_copyin(&entry, entry_va, sizeof(entry));
+            kernel_copyout(entry_va, &entry, sizeof(entry));
+            std::print("This is level: {:02d} - Add: 0x{:016x} Entry: 0x{:016x} - G Cleared\n", level, entry_va, entry);
+            uint64_t page_size = (level == 1) ? (1ULL << 30) : (1ULL << 21);
+            return (entry & PDE_ADDR_MASK) | (va & (page_size - 1));
+        }
+
+        if (level == 3) {
+            // Clear Global Bit
+            CLEAR_PDE_BIT(entry, GLOBAL);
+            kernel_copyin(&entry, entry_va, sizeof(entry));
+            kernel_copyout(entry_va, &entry, sizeof(entry));
+            std::print("This is level: {:02d} - Add: 0x{:016x} Entry: 0x{:016x} - G Cleared\n", level, entry_va, entry);
+            return (entry & PDE_ADDR_MASK) | (va & 0xFFF);
+        }
+
+        table_phys = entry & PDE_ADDR_MASK;
+    }
+    return 0;
 }
