@@ -113,18 +113,6 @@ uint64_t get_vmcb (hv_defeat_ctx *ctx, int core) {
     tmr16_base = tmr16_base << 16;
 
     switch (ctx->fw) {
-        case 0x0200:
-        case 0x0220:
-        case 0x0225:
-        case 0x0226:
-        case 0x0230:
-        case 0x0250:
-        case 0x0270:
-            if( core == 0 )
-                return (uint64_t)tmr16_base + (uint64_t)0x11BD000;
-            else
-                return (uint64_t)tmr16_base + (uint64_t)0x14E2000 + (uint64_t)core * 0x4000;
-            break;
         case 0x0300:
         case 0x0310:
         case 0x0320:
@@ -149,7 +137,7 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx)
 
     uint64_t vcpu_off = fw_off(ctx->fw, "HV_VCPU");
     uint64_t stride   = fw_off(ctx->fw, "HV_VCPU_CPUID");
-    // Testing direct VMCB on 04.03
+    
     if ((!vcpu_off || !stride) && ctx->fw < 0x0300) {
         std::print("  missing HV_VCPU offsets for fw 0x{:04x}\n", ctx->fw);
         return -1;
@@ -175,8 +163,22 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx)
 
     ctx->vmcb_count = 0;
     for (int c = 0; c < 16; c++) {
+        uint64_t vmcb_pa;
 
-        uint64_t vmcb_pa = get_vmcb(ctx, c);
+        if (ctx->fw < 0x0300) {
+            // FW 1.xx/2.xx: read VMCB pointer from per-CPU struct via GPU
+            uint64_t ptr_pa = hv_data_pa + vcpu_off + (uint64_t)c * stride;
+            uint64_t vmcb_va = gpu_read_phys8(ptr_pa);
+            if ((vmcb_va >> 32) != 0xFFFFFFFF || (vmcb_va & 0xFFF) != 0) {
+                std::print("  core {:2d}: bad vmcb_va 0x{:x}\n", c, vmcb_va);
+                return -2;
+            }
+            vmcb_pa = pmap_kextract(vmcb_va);
+        } else {
+            // FW 3.xx/4.xx: deterministic from SEV pool
+            vmcb_pa = get_vmcb(ctx, c);
+        }
+
         std::print("  core {:2d}: pa=0x{:x}\n", c, vmcb_pa);
 
         if (ctx->vmcb_count < MAX_VMCBS) {
@@ -186,6 +188,7 @@ int stage2_find_vmcbs(hv_defeat_ctx *ctx)
     }
     
     std::print("  {} vmcbs\n", ctx->vmcb_count);
+
     return ctx->vmcb_count == 0 ? -2 : 0;
 }
 
@@ -222,14 +225,13 @@ int stage3_patch_vmcbs(hv_defeat_ctx *ctx, iommu_ctx *iommu) {
     for (int i = 0; i < ctx->vmcb_count; i++) {
         uint64_t pa = ctx->vmcb_pas[i];
 
-        iommu_write8_pa(iommu, pa + 0x00, 0x0000000000000000ULL);
-        iommu_write8_pa(iommu, pa + 0x08, 0x0004000000000000ULL);
-        iommu_write8_pa(iommu, pa + 0x10, 0x000000000000000FULL);
-        iommu_write8_pa(iommu, pa + 0x58, 0x0000000000000001ULL);
+        //iommu_write8_pa(iommu, pa + 0x00, 0x0000000000000000ULL);
+        //iommu_write8_pa(iommu, pa + 0x08, 0x0004000000000000ULL);
+        //iommu_write8_pa(iommu, pa + 0x10, 0x000000000000000FULL);
+        //iommu_write8_pa(iommu, pa + 0x58, 0x0000000000000001ULL);
         iommu_write8_pa(iommu, pa + 0x90, 0x0000000000000000ULL);
 
         std::print("  vmcb[{:2d}] patched (pa=0x{:x})\n", i, pa);
-        usleep(1000);
     }
 
     pin_to_core(9);
@@ -309,7 +311,6 @@ int stage3b_remove_xotext(hv_defeat_ctx *ctx) {
 
 
 int stage4_verify(hv_defeat_ctx *ctx) {
-    usleep(5000000);
     std::print("\n[stage4] verify\n");
 
     uint64_t ktext = kr8((uint64_t)KERNEL_ADDRESS_TEXT_BASE);
@@ -374,14 +375,11 @@ static int widen_cpuset_syscall() {
 
     std::print("[clear_smap_smep_nda] before kernel_copyin into ktext code cave");
 
-    usleep(3000000);
-
     kernel_copyin(gadget, gadget_va, sizeof(gadget));
     int done = 0;
     for (int i = 0; i < 16; i++) {
         if (pin_to_core(i) == 0) {
             kexec(gadget_va);
-            usleep(1000);
             done++;
         }
     }
@@ -597,15 +595,12 @@ int run_hv_defeat(void) {
                 asm volatile("vmmcall");
             }
 
-            usleep(1000);
             std::print("[vmmcall] core: {:2d} {}\n", i,
                 vmmcall_faulted ? "SIGILL (caught)" : "ok");
         }
 
         signal(SIGILL, old_handler);
     }
-
-    usleep(1000000);
 
     kernel_pmap_invalidate_all();
 
@@ -615,13 +610,17 @@ int run_hv_defeat(void) {
 
     if ((r = stage6_install_kexec(&ctx))) return r;
 
-    clear_smap_smep_nda(&ctx);
+    //clear_smap_smep_nda(&ctx);
 
-    //stage7_run_hen(&ctx);
+    stage7_run_hen(&ctx);
 
     uint32_t fw_ver = kernel_get_fw_version();
-    notify(std::format("Welcome To PS5HEN 1.3\nPlayStation 5 FW: {:d}.{:02d}\nBy SpecterDev, f0f, flat_z",
-        (fw_ver >> 24) & 0xFF, (fw_ver >> 16) & 0xFF));
+
+    uint32_t fw_major = (fw_ver & 0xFF000000) >> 24;
+    uint32_t fw_minor = (fw_ver & 0xFF0000) >> 16;
+
+    notify(std::format("Welcome To PS5HEN 1.3\nPlayStation 5 FW: {:d}.{:X}\nBy SpecterDev, f0f, flat_z",
+        fw_major, fw_minor ) );
 
 
     /*uint64_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
